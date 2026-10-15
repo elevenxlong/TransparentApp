@@ -64,8 +64,8 @@
 
        powershell -ExecutionPolicy Bypass -File TransparentApp.ps1 -RestoreAll
 
-     TransparentApp.ps1 在 %LOCALAPPDATA%\TransparentApp\ 下，
-     如果那里没有，把 exe 再运行一次就会解出来。
+     这两条命令要在源码目录里跑（TransparentApp.ps1 和 Win.cs 放一起）；
+     exe 不把脚本解到磁盘，命令行模式是给源码目录用的。
 
   2) 面板自己弹出来了，想知道为什么
 
@@ -94,7 +94,7 @@
 
   5) 完全没法操作了
 
-     任务管理器结束 powershell.exe（跑着 TransparentApp.ps1 的那个），
+     任务管理器结束 TransparentApp.exe（可能有两个：主进程和看门狗），
      然后按 1) 里的命令收尾。
 
 
@@ -104,7 +104,8 @@
   %APPDATA%\TransparentApp\ui.log           面板显示 / 隐藏记录
   %APPDATA%\TransparentApp\recovery.log     异常退出后的自动还原记录
   %APPDATA%\TransparentApp\live.json        运行时现场（程序在跑时才有）
-  %LOCALAPPDATA%\TransparentApp\            运行时解出来的脚本和图标
+  %LOCALAPPDATA%\TransparentApp\            运行时解出来的图标
+  %APPDATA%\TransparentApp\host.log          exe 宿主脚本时的报错记录（正常时是空的）
 
 
 六、已知限制

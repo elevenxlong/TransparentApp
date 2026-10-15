@@ -13,9 +13,13 @@ TransparentApp 原型（Windows 单文件、零依赖，系统自带 PowerShell 
 #>
 param([switch]$SelfTest, [switch]$Detached, [switch]$UiTest, [switch]$Restore, [switch]$RestoreAll, [int]$Watchdog = 0)
 
+# 由 TransparentApp.exe 进程内宿主时，启动器会先注入这几个变量；直接跑 .ps1 时它们都不存在。
+# $Hosted 用来关掉下面那段「自己再分叉一次」的逻辑——宿主模式下本来就是唯一的进程。
+if ($HostedWatchdog -gt 0) { $Watchdog = $HostedWatchdog }
+
 # 消息循环会一直占着控制台，表现就是「命令卡住、没有入口」。默认甩到后台跑，
 # 终端立刻回到提示符；真正干活的进程带 -Detached，不再重复分叉。
-if (-not $Detached -and -not $SelfTest -and -not $UiTest -and -not $Restore -and -not $RestoreAll -and $Watchdog -eq 0) {
+if (-not $Hosted -and -not $Detached -and -not $SelfTest -and -not $UiTest -and -not $Restore -and -not $RestoreAll -and $Watchdog -eq 0) {
     # -WindowStyle Hidden 只压控制台；但它把 STARTUPINFO.wShowWindow 设成 SW_HIDE，
     # 子进程第一次 ShowWindow 会把控制面板一起隐藏掉，表现为「进程活着但看不到面板」
     # （走 CreateNoWindow 能绕开这点，但子进程会挂在调用方终端上，命令看起来像没返回）。
@@ -32,203 +36,13 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 if (-not ("Win" -as [type])) {
-Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class Win {
-    delegate bool EnumProc(IntPtr h, IntPtr p);
-
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextLengthW(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    // 用 GetWindowLongPtrW：仅在 64 位进程存在，所以原型只支持 64 位 PowerShell
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
-    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
-    [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
-    [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
-    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
-    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
-    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
-    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
-    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
-
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
-
-    const int GWL_EXSTYLE = -20;
-    const long WS_EX_LAYERED = 0x00080000;
-    const long WS_EX_TOOLWINDOW = 0x00000080;
-    const uint LWA_ALPHA = 0x2;
-
-    public static List<IntPtr> Windows() {
-        var list = new List<IntPtr>();
-        EnumWindows(delegate(IntPtr h, IntPtr p) {
-            if (!IsWindowVisible(h)) return true;
-            if (GetWindowTextLengthW(h) == 0) return true;
-            if ((GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64() & WS_EX_TOOLWINDOW) != 0) return true;
-            list.Add(h);
-            return true;
-        }, IntPtr.Zero);
-        return list;
+    # 从 exe 启动时 Win 类已经编进 exe 里，这段不会执行；
+    # 只有直接跑 .ps1（开发/自检）才会走到这里，需要同目录的 Win.cs
+    $winCs = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'Win.cs' } else { $null }
+    if (-not $winCs -or -not (Test-Path -LiteralPath $winCs)) {
+        throw "找不到 Win.cs：请用 TransparentApp.exe 启动，或把 Win.cs 和 TransparentApp.ps1 放在同一目录"
     }
-
-    public static string Title(IntPtr h) {
-        var sb = new StringBuilder(GetWindowTextLengthW(h) + 1);
-        GetWindowTextW(h, sb, sb.Capacity);
-        return sb.ToString();
-    }
-
-    public static string Class(IntPtr h) {
-        var sb = new StringBuilder(256);
-        GetClassNameW(h, sb, sb.Capacity);
-        return sb.ToString();
-    }
-
-    public static bool IsTool(IntPtr h) {
-        return (GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64() & WS_EX_TOOLWINDOW) != 0;
-    }
-
-    public static uint Pid(IntPtr h) { uint p; GetWindowThreadProcessId(h, out p); return p; }
-
-    // 进程名查一次要几毫秒，而轮询要频繁重扫窗口，所以带 10 秒 TTL 的缓存。
-    // 留 TTL 是为了兜住 pid 复用：过期后重新解析，不会一直用旧名字。
-    class NameEntry { public string Name; public DateTime At; }
-    static Dictionary<uint, NameEntry> _names = new Dictionary<uint, NameEntry>();
-    public static string Proc(IntPtr h) {
-        uint pid = Pid(h);
-        NameEntry e;
-        if (_names.TryGetValue(pid, out e) && (DateTime.UtcNow - e.At).TotalSeconds < 10) return e.Name;
-        string name;
-        try { name = Process.GetProcessById((int)pid).ProcessName; } catch { name = pid.ToString(); }
-        _names[pid] = new NameEntry { Name = name, At = DateTime.UtcNow };
-        return name;
-    }
-
-    /// 所有可见顶层窗口，不带「必须有标题」「不是工具窗口」的过滤：
-    /// 派生窗口（微信表情面板、Chrome 的弹出层）往往没标题、还带 WS_EX_TOOLWINDOW
-    public static List<IntPtr> AllTopLevel() {
-        var list = new List<IntPtr>();
-        EnumWindows(delegate(IntPtr h, IntPtr p) {
-            if (IsWindowVisible(h)) list.Add(h);
-            return true;
-        }, IntPtr.Zero);
-        return list;
-    }
-
-    /// 属主窗口：弹窗/对话框靠它挂在主窗口上
-    public static IntPtr Owner(IntPtr h) { return GetWindow(h, 4); }   // GW_OWNER
-
-    public static bool HasLayered(IntPtr h) {
-        return (GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64() & WS_EX_LAYERED) != 0;
-    }
-
-    // none = 没分层；lwa = 用 SetLayeredWindowAttributes（我们这种统一 alpha）；
-    // perpixel = 用 UpdateLayeredWindow 自己画（Qt 弹窗、圆角/阴影窗口都是这种）
-    public static string LayeredMode(IntPtr h) {
-        if (!HasLayered(h)) return "none";
-        uint key, flags; byte a;
-        return GetLayeredWindowAttributes(h, out key, out a, out flags) ? "lwa" : "perpixel";
-    }
-
-    /// WS_EX_NOREDIRECTIONBITMAP：窗口自己没有重定向位图（DComp/DXGI 直出），统一 alpha 对它没意义
-    public static bool NoRedirectionBitmap(IntPtr h) {
-        return (GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64() & 0x00200000L) != 0;
-    }
-
-    /// 当前实际生效的 alpha；窗口没有 layered 时返回 -1
-    public static int GetAlpha(IntPtr h) {
-        uint key, flags; byte alpha;
-        if (!GetLayeredWindowAttributes(h, out key, out alpha, out flags)) return -1;
-        return alpha;
-    }
-
-    // 100% 时清掉 WS_EX_LAYERED，让窗口拿回 DWM 硬件合成（Chrome 被 layered 后容易掉帧）
-    // ponytail: 无条件清除会覆盖目标窗口原有的 layered 标志，原型接受
-    public static bool SetAlpha(IntPtr h, int alpha) {
-        long ex = GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64();
-        if (alpha >= 255) { SetWindowLongPtr(h, GWL_EXSTYLE, (IntPtr)(ex & ~WS_EX_LAYERED)); return true; }
-        SetWindowLongPtr(h, GWL_EXSTYLE, (IntPtr)(ex | WS_EX_LAYERED));
-        return SetLayeredWindowAttributes(h, 0, (byte)alpha, LWA_ALPHA);
-    }
-
-    public static bool Alive(IntPtr h) { return IsWindow(h); }
-
-    /// 宿主进程是 powershell.exe，任务栏默认拿它的图标；显式指定 AppUserModelID 后才会用窗口自己的图标
-    public static int SetAppId(string id) {
-        try { return SetCurrentProcessExplicitAppUserModelID(id); } catch { return -1; }
-    }
-
-    /// WM_GETICON + ICON_BIG：拿窗口自己设的大图标句柄，用来确认不是宿主进程的图标
-    public static IntPtr GetWindowIcon(IntPtr h) { return SendMessage(h, 0x7F, (IntPtr)1, IntPtr.Zero); }
-
-    /// 异步发 WM_CLOSE，等于点了这个窗口的 ×。
-    /// 用 Post 不用 Send：程序弹「要保存吗」时 Send 会把我们的界面线程一起卡住
-    public static bool PostClose(IntPtr h) { return PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
-    public static bool Minimized(IntPtr h) { return IsIconic(h); }
-    public static void Minimize(IntPtr h) { ShowWindow(h, 6); }
-    public static void Restore(IntPtr h) { ShowWindow(h, 9); }
-    public static bool Visible(IntPtr h) { return IsWindowVisible(h); }
-    // 启动时若带了 STARTUPINFO.wShowWindow=SW_HIDE，第一次 ShowWindow 会被吃掉，得再补一次
-    public static void ShowIt(IntPtr h) {
-        ShowWindow(h, 9);
-        ShowWindow(h, 5);
-        BringWindowToTop(h);
-        SetForegroundWindow(h);
-    }
-
-    public static bool Rect(IntPtr h, out int l, out int t, out int r, out int b) {
-        RECT rc; bool ok = GetWindowRect(h, out rc);
-        l = rc.Left; t = rc.Top; r = rc.Right; b = rc.Bottom; return ok;
-    }
-
-    public static bool Cursor(out int x, out int y) {
-        POINT p; bool ok = GetCursorPos(out p); x = p.X; y = p.Y; return ok;
-    }
-
-    /// 光标下最深层窗口所属进程；用来判断「光标还在同一个应用里」
-    public static uint PidAt(int x, int y) {
-        var p = new POINT(); p.X = x; p.Y = y;
-        IntPtr h = WindowFromPoint(p);
-        return h == IntPtr.Zero ? 0 : Pid(h);
-    }
-
-    public static IntPtr WindowAt(int x, int y) {
-        var p = new POINT(); p.X = x; p.Y = y;
-        return WindowFromPoint(p);
-    }
-
-    /// 光标下那个窗口所属的顶层窗口，用来和受管窗口比身份
-    public static IntPtr RootOf(IntPtr h) {
-        return h == IntPtr.Zero ? IntPtr.Zero : GetAncestor(h, 2);   // GA_ROOT
-    }
-
-    /// a 是否压在 b 上面：沿 z 序从 b 往上走，能碰到 a 就是
-    public static bool Above(IntPtr a, IntPtr b) {
-        if (a == IntPtr.Zero || b == IntPtr.Zero) return false;
-        IntPtr cur = b;
-        for (int i = 0; i < 4096 && cur != IntPtr.Zero; i++) {
-            if (cur == a) return true;
-            cur = GetWindow(cur, 3);   // GW_HWNDPREV
-        }
-        return false;
-    }
-}
-'@
+    Add-Type -Path $winCs
 }
 
 # -Watchdog <主进程pid>：跟着主进程跑，主进程异常退出时把窗口恢复原样。
@@ -309,8 +123,8 @@ $script:lastIn     = @{}     # 窗口句柄 -> 最后一次确认光标在该窗
 $script:wasMin     = @{}     # 窗口句柄 -> 上一轮是否最小化，用来识别「刚被还原」
 $script:applied    = @{}     # 句柄 -> 上次真正设下去的 alpha，避免每轮都重复调 API
 $script:insideCache = @{}    # 句柄 -> 上一轮光标是否在该窗口内
-$script:origLayered = @{}    # 句柄 -> 我们动手前的分层状态（退出时照着还原）
-$script:skipWin     = @{}    # 句柄 -> 不碰（自己就在做分层透明的窗口）
+$script:checkedWin  = @{}    # 句柄 -> 已经判定过「能不能碰」了
+$script:skipWin     = @{}    # 句柄 -> 不碰（自己就在逐像素分层画的窗口）
 $script:group      = @{}     # 目标窗口句柄 -> 它自己 + 派生窗口（这一组一起受这份配置管）
 $script:candidates = @()     # 当前可当目标的窗口（有标题、非工具窗口的主窗口）
 $script:closeAsked = @{}     # 已经请求过关窗的目标，避免每轮轮询重复发 WM_CLOSE
@@ -572,15 +386,16 @@ function Get-WantAlpha($cfg, [bool]$inside) {
 
 # 唯一的下发点：算出目标值，变了才调 API（有些程序重绘后会丢 WS_EX_LAYERED，那种也要补一次）
 function Set-TargetAlpha([IntPtr]$h, $cfg, [bool]$inside) {
-    # 动手前先记住它本来是什么分层状态，退出时按原样还回去
-    if (-not $script:origLayered.ContainsKey($h)) {
-        $mode = [Win]::LayeredMode($h)
-        $script:origLayered[$h] = @{ mode = $mode; alpha = [Win]::GetAlpha($h) }
-        if ($mode -ne 'none' -or [Win]::NoRedirectionBitmap($h)) {
-            # 它自己就在做透明（Qt 弹窗那种逐像素分层），套统一 alpha 会让它整块变黑 —— 宁可它不透明，
-            # 也不能让它画不出来。这类窗口直接跳过，连退出还原都不碰
+    # 每个句柄只判定一次能不能碰
+    if (-not $script:checkedWin.ContainsKey($h)) {
+        $script:checkedWin[$h] = $true
+        # 只有「自己在逐像素分层画」或「自己没有重定向位图（DComp/DXGI 直出）」的窗口不能套统一 alpha：
+        # 套上去它整块画不出来变黑，宁可让它保持不透明。
+        # 判定条件不能写成「已经 layered」——被强杀之后，我们自己打过的透明度也会留成 layered，
+        # 那样下次启动就会把 Chrome、微信这类主窗口永久跳过，滑块怎么拖都不生效
+        if ([Win]::LayeredMode($h) -eq 'perpixel' -or [Win]::NoRedirectionBitmap($h)) {
             $script:skipWin[$h] = $true
-            Write-UiLog ("跳过 0x{0:X}（{1} - {2}）：它自己用分层透明，改成统一透明度会让它变黑" -f $h.ToInt64(), [Win]::Proc($h), [Win]::Title($h))
+            Write-UiLog ("跳过 0x{0:X}（{1} - {2}）：它自己用逐像素分层透明，改成统一透明度会让它变黑" -f $h.ToInt64(), [Win]::Proc($h), [Win]::Title($h))
         }
     }
     if ($script:skipWin.ContainsKey($h)) { return }
@@ -617,19 +432,14 @@ function Restore-All {
 
 function Reset-Alpha {
     # 只还原我们真正动过的句柄，别去碰同进程里我们没改过的窗口
+    # 一律还成 255（清掉分层位）。不保留「窗口本来就有 alpha 就还回原值」那套：
+    # 被强杀之后，那个 alpha 恰恰是我们自己留下的，照着还原等于把窗口永久钉在透明状态
     foreach ($h in @($script:applied.Keys)) {
-        if (-not [Win]::Alive($h)) { continue }
-        $orig = $script:origLayered[$h]
-        if ($orig -and $orig.mode -eq 'lwa' -and [int]$orig.alpha -ge 0) {
-            # 这个窗口本来就有自己的 alpha，还原成它原来的值，而不是粗暴清掉分层位
-            [Win]::SetAlpha($h, [int]$orig.alpha) | Out-Null
-        } else {
-            [Win]::SetAlpha($h, 255) | Out-Null
-        }
+        if ([Win]::Alive($h)) { [Win]::SetAlpha($h, 255) | Out-Null }
     }
     $script:applied.Clear()
     $script:insideCache.Clear()
-    $script:origLayered.Clear()
+    $script:checkedWin.Clear()
     $script:skipWin.Clear()
 }
 
@@ -777,9 +587,11 @@ try { [System.Windows.Forms.Application]::add_ThreadException($onFatal) } catch 
 # ---------------- 控制面板 ----------------
 # 托盘和任务栏用同一份 .ico：任务栏按 32 取，托盘按系统小图标尺寸取
 function New-AppIcon([int]$size) {
+    # 从 exe 启动时图标由启动器解到 %LOCALAPPDATA%；直接跑 .ps1 时用脚本同目录那份
+    $icoPath = $HostedIconPath
+    if (-not $icoPath -and $PSScriptRoot) { $icoPath = Join-Path $PSScriptRoot 'TransparentApp.ico' }
     try {
-        $icoPath = Join-Path $PSScriptRoot 'TransparentApp.ico'
-        if (Test-Path -LiteralPath $icoPath) { return (New-Object System.Drawing.Icon($icoPath, $size, $size)) }
+        if ($icoPath -and (Test-Path -LiteralPath $icoPath)) { return (New-Object System.Drawing.Icon($icoPath, $size, $size)) }
     } catch { }
     return [System.Drawing.SystemIcons]::Application
 }
@@ -1393,16 +1205,26 @@ Write-UiLog ("启动（pid={0}）" -f $PID)
 if (-not ($SelfTest -or $UiTest -or $Restore -or $Watchdog -gt 0)) {
     # 走 WMI 起，看门狗挂在 WmiPrvSE 下面而不是我们的进程树里：
     # 否则任务管理器「结束任务」连带子树一起杀时，看门狗会跟主进程一起死，那就没人收尾了
-    $wdCmd = 'powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File "{0}" -Watchdog {1}' -f $PSCommandPath, $PID
+    # 宿主模式下看门狗就是同一个 exe 的 --watchdog 模式，不再拉 powershell 子进程
+    $wdCmd = if ($HostedExe) {
+        '"{0}" --watchdog {1}' -f $HostedExe, $PID
+    } else {
+        'powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File "{0}" -Watchdog {1}' -f $PSCommandPath, $PID
+    }
     $started = $false
     try {
         $r = ([wmiclass]'Win32_Process').Create($wdCmd)
         if ($null -ne $r -and $r.ReturnValue -eq 0) { $started = $true }
     } catch { }
     if (-not $started) {
+        # WMI 起不来时退回进程树内兜一个：被「结束任务树」连带杀时靠 live.json 在下次启动补还原
         try {
-            Start-Process powershell -ArgumentList '-WindowStyle', 'Hidden', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                '-File', "`"$PSCommandPath`"", '-Watchdog', $PID -WindowStyle Hidden
+            if ($HostedExe) {
+                Start-Process -FilePath $HostedExe -ArgumentList '--watchdog', $PID -WindowStyle Hidden
+            } else {
+                Start-Process powershell -ArgumentList '-WindowStyle', 'Hidden', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                    '-File', "`"$PSCommandPath`"", '-Watchdog', $PID -WindowStyle Hidden
+            }
         } catch { }
     }
 }

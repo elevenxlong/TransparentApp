@@ -109,15 +109,15 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 `%APPDATA%\TransparentApp\live.json`，看门狗醒来发现文件不在就什么都不做；文件还在就说明是异常退出，
 于是按里面记的窗口句柄把透明度和最小化状态还原，并写一行记录到 `%APPDATA%\TransparentApp\recovery.log`。
 
-看门狗是走 WMI 起的，父进程是 `WmiPrvSE` 而不是主程序——**不在同一棵进程树上**，所以任务管理器
-"结束任务"连带子树一起杀时它照样活着。
+看门狗是同一个 exe 的 `--watchdog` 模式，走 WMI 起，父进程是 `WmiPrvSE` 而不是主程序——**不在同一棵
+进程树上**，所以任务管理器"结束任务"连带子树一起杀时它照样活着。
 
 实测：强杀主进程，4 秒内窗口恢复原样、`live.json` 被清理、日志记下
 `主进程 7124 异常退出，已还原 1 个窗口的透明度、0 个最小化窗口`。
 
 另外启动时如果发现上次留下的 `live.json`（说明上次崩了而且看门狗也被一起杀了），会先补还原一次。
 
-反面情况：如果连看门狗一起杀掉（例如 `taskkill /F /IM powershell.exe`），就没人收尾了，这时手动跑：
+反面情况：如果连看门狗一起杀掉（例如 `taskkill /F /IM TransparentApp.exe`），就没人收尾了，这时手动跑：
 
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\TransparentApp.ps1 -Restore
@@ -151,12 +151,15 @@ powershell -ExecutionPolicy Bypass -File .\TransparentApp.ps1 -Restore
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物是单个 `dist\TransparentApp.exe`（约 67 KB）：
+产物是单个 `dist\TransparentApp.exe`（约 106 KB）：
 
 - 用 Windows 自带的 `.NET Framework\...\csc.exe` 编译，不需要装 SDK、不需要联网。
 - `TransparentApp.ps1` 和 `TransparentApp.ico` 以资源形式嵌进 exe，图标同时设为 exe 自身的图标。
-- 启动时先把两者解到 `%LOCALAPPDATA%\TransparentApp\`，再拉起 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ... -Detached` 跑脚本。
-- 单实例：exe 会持有互斥量并等待子进程退出，重复双击不会开出第二个托盘图标。
+- 启动时只解一个 `.ico` 到 `%LOCALAPPDATA%\TransparentApp\`。**脚本不落盘**：用 `System.Management.Automation`
+  在 exe 自己的进程里直接执行，`Win` 类也预编译进 exe。所以运行时不会出现 `powershell.exe -ExecutionPolicy Bypass`
+  子进程，也不会调 `Add-Type` 去现场编译 C#——连同「往 `%LOCALAPPDATA%` 写脚本」这三条，正是杀软判定释放器的特征。
+- 单实例：exe 持有互斥量；重复双击不新开窗口，而是写一张 `show.request`，让已在跑的实例把面板调出来。
+- 直接跑 `TransparentApp.ps1`（开发、`-SelfTest`、`-UiTest`、`-Restore`）需要同目录的 `Win.cs`，exe 不需要。
 
 ## 配置持久化
 
@@ -186,9 +189,11 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - `TransparentApp.ps1`：全部逻辑。
 - `TransparentApp.ico`：**任务栏和托盘共用**的图标，16/20/24/32/48/64/128/256 多尺寸 PNG 封装。
   任务栏取 32×32，托盘取系统小图标尺寸。想换图标直接替换同名文件即可。
-  面板是跑在 `powershell.exe` 里的，所以另外调了 `SetCurrentProcessExplicitAppUserModelID`——
-  不做这一步的话任务栏会一直显示宿主进程那个蓝色 PowerShell 图标，窗口自己设的图标不生效。
-- `Launcher.cs`：打包用的启动器，由 `build.ps1` 编译。
+- 面板以前跑在 `powershell.exe` 里，所以要调 `SetCurrentProcessExplicitAppUserModelID`，
+  否则任务栏会换成宿主的蓝色 PowerShell 图标；现在宿主就是 exe 自己，这一步留着但不再是必需。
+- `Win.cs`：全部 Win32 P/Invoke 与窗口枚举逻辑。`build.ps1` 把它编进 exe；直接跑 `.ps1` 时由脚本用
+  `Add-Type -Path` 现场编译同一份文件，两边只有这一份真相。
+- `Launcher.cs`：启动器。管单实例、解图标、用 `System.Management.Automation` 在进程内跑脚本。
 - `build.ps1`：打包脚本，产出 `dist\TransparentApp.exe`。
 
 ## 限制

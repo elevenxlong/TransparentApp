@@ -22,9 +22,23 @@ foreach ($frameworkDir in "$env:WINDIR\Microsoft.NET\Framework64", "$env:WINDIR\
 }
 if (-not $csc) { throw "找不到 csc.exe；需要 .NET Framework 4.x（Windows 自带，装个 .NET Framework 运行时即可）" }
 
-foreach ($f in 'TransparentApp.ps1', 'TransparentApp.ico', 'Launcher.cs') {
+foreach ($f in 'TransparentApp.ps1', 'TransparentApp.ico', 'Launcher.cs', 'Win.cs') {
     if (-not (Test-Path (Join-Path $root $f))) { throw "缺少打包素材：$f" }
 }
+
+# 启动器要把脚本宿主在本进程里，需要 Windows PowerShell 5.1 的 System.Management.Automation.dll。
+# 各版本 Windows 放的位置不一样（较新的只在 GAC 里），所以按候选路径找
+$sma = @(
+    "$env:WINDIR\System32\WindowsPowerShell\v1.0\System.Management.Automation.dll"
+    "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\System.Management.Automation.dll"
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $sma) {
+    $sma = Get-ChildItem "$env:WINDIR\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation" -Recurse `
+        -Filter 'System.Management.Automation.dll' -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $sma) { throw "找不到 System.Management.Automation.dll（需要 Windows PowerShell 5.1）" }
+Write-Host "宿主程序集：$sma"
 
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
@@ -33,10 +47,12 @@ $exe = Join-Path $dist 'TransparentApp.exe'
 $cscArgs = @(
     '/nologo', '/target:winexe', '/platform:anycpu', '/optimize+'
     "/win32icon:$root\TransparentApp.ico"
+    "/reference:$sma"
     "/resource:$root\TransparentApp.ps1,app.ps1"
     "/resource:$root\TransparentApp.ico,app.ico"
     "/out:$exe"
     (Join-Path $root 'Launcher.cs')
+    (Join-Path $root 'Win.cs')
 )
 & $csc.FullName @cscArgs
 if ($LASTEXITCODE -ne 0) { throw "编译失败，csc exit=$LASTEXITCODE" }
@@ -51,6 +67,6 @@ if (Test-Path $doc) {
     Copy-Item -LiteralPath $doc -Destination (Join-Path $dist '使用说明.txt') -Force
     Write-Host "已附上使用说明：$(Join-Path $dist '使用说明.txt')"
 }
-Write-Host "双击 exe 即可运行；启动时会把脚本解到 %LOCALAPPDATA%\TransparentApp 再拉起。"
+Write-Host "双击 exe 即可运行；脚本在 exe 进程内直接执行，不再解出 .ps1、也不拉 powershell 子进程。"
 
 if ($Run) { Start-Process $exe }
