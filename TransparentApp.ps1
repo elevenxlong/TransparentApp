@@ -356,6 +356,22 @@ function Get-Group([IntPtr]$h) {
     return @($h)
 }
 
+# 光标下那个顶层窗口是不是「这个目标自己人」：目标本身、它的派生窗口，或挂在它们下面的弹窗。
+# 不能拿进程当条件——同一个 Chrome 开的另一个主窗口也属于 chrome.exe，但它不是这个目标
+function Test-BelongsToGroup([IntPtr]$top, $hwnds) {
+    if ($top -eq [IntPtr]::Zero) { return $false }
+    foreach ($h in $hwnds) { if ($h -eq $top) { return $true } }
+    # 弹窗靠属主挂在主窗口上：沿属主链往上找，碰到这一组里的窗口就算
+    $cur = $top
+    for ($i = 0; $i -lt 8; $i++) {
+        $owner = [Win]::Owner($cur)
+        if ($owner -eq [IntPtr]::Zero) { break }
+        $cur = [Win]::RootOf($owner)
+        foreach ($h in $hwnds) { if ($h -eq $cur) { return $true } }
+    }
+    return $false
+}
+
 # 启动后按指纹把上次的目标窗口找回来
 function Restore-SavedTargets {
     $script:cfgRestored = $true
@@ -1125,7 +1141,7 @@ $timer.add_Tick({
 
     $x = 0; $y = 0
     if (-not [Win]::Cursor([ref]$x, [ref]$y)) { return }
-    $pidAt = [Win]::PidAt($x, $y)
+    $topAt = [Win]::RootOf([Win]::WindowAt($x, $y))
     $now = Get-Date
 
     foreach ($name in @($script:targets.Keys)) {
@@ -1138,20 +1154,17 @@ $timer.add_Tick({
         $cfg = $script:targets[$name]
         $hwnds = @(Get-Group $name)
         if ($hwnds.Count -eq 0) { continue }
-        $p = [Win]::Pid($name)
 
-        # 光标落在这个程序的任一窗口（含派生窗口）上就算「在里面」；
-        # 否则再看是否落在某个窗口矩形内、并且那个窗口没被别的窗口压住
-        $inside = ($pidAt -eq $p)
+        # 光标落在「这个目标自己人」身上才算在里面；否则再看是否落在某个窗口矩形内、
+        # 并且那个窗口压在光标下那个窗口上面（alpha 0 时点不通，只能靠 z 序判断）
+        $inside = Test-BelongsToGroup $topAt $hwnds
         if (-not $inside) {
             foreach ($h in $hwnds) {
                 if ([Win]::Minimized($h)) { continue }
                 $l = 0; $t = 0; $r = 0; $b = 0
                 if (-not [Win]::Rect($h, [ref]$l, [ref]$t, [ref]$r, [ref]$b)) { continue }
                 if ($x -lt $l -or $x -ge $r -or $y -lt $t -or $y -ge $b) { continue }
-                # 窗口 alpha 0 时点不通，WindowFromPoint 看不到它，所以改用 z 序判断它是不是最上面那个
-                $top = [Win]::RootOf([Win]::WindowAt($x, $y))
-                if (($top -eq $h) -or ([Win]::Pid($top) -eq $p) -or [Win]::Above($h, $top)) { $inside = $true; break }
+                if ([Win]::Above($h, $topAt)) { $inside = $true; break }
             }
         }
 

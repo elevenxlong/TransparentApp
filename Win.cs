@@ -165,13 +165,6 @@ public static class Win {
         POINT p; bool ok = GetCursorPos(out p); x = p.X; y = p.Y; return ok;
     }
 
-    /// 光标下最深层窗口所属进程；用来判断「光标还在同一个应用里」
-    public static uint PidAt(int x, int y) {
-        var p = new POINT(); p.X = x; p.Y = y;
-        IntPtr h = WindowFromPoint(p);
-        return h == IntPtr.Zero ? 0 : Pid(h);
-    }
-
     public static IntPtr WindowAt(int x, int y) {
         var p = new POINT(); p.X = x; p.Y = y;
         return WindowFromPoint(p);
