@@ -59,6 +59,8 @@ public static class Win {
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
@@ -135,6 +137,19 @@ public static class Win {
         return (GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64() & WS_EX_LAYERED) != 0;
     }
 
+    // none = 没分层；lwa = 用 SetLayeredWindowAttributes（我们这种统一 alpha）；
+    // perpixel = 用 UpdateLayeredWindow 自己画（Qt 弹窗、圆角/阴影窗口都是这种）
+    public static string LayeredMode(IntPtr h) {
+        if (!HasLayered(h)) return "none";
+        uint key, flags; byte a;
+        return GetLayeredWindowAttributes(h, out key, out a, out flags) ? "lwa" : "perpixel";
+    }
+
+    /// WS_EX_NOREDIRECTIONBITMAP：窗口自己没有重定向位图（DComp/DXGI 直出），统一 alpha 对它没意义
+    public static bool NoRedirectionBitmap(IntPtr h) {
+        return (GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64() & 0x00200000L) != 0;
+    }
+
     /// 当前实际生效的 alpha；窗口没有 layered 时返回 -1
     public static int GetAlpha(IntPtr h) {
         uint key, flags; byte alpha;
@@ -169,7 +184,12 @@ public static class Win {
     public static void Restore(IntPtr h) { ShowWindow(h, 9); }
     public static bool Visible(IntPtr h) { return IsWindowVisible(h); }
     // 启动时若带了 STARTUPINFO.wShowWindow=SW_HIDE，第一次 ShowWindow 会被吃掉，得再补一次
-    public static void ShowIt(IntPtr h) { ShowWindow(h, 5); }
+    public static void ShowIt(IntPtr h) {
+        ShowWindow(h, 9);
+        ShowWindow(h, 5);
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+    }
 
     public static bool Rect(IntPtr h, out int l, out int t, out int r, out int b) {
         RECT rc; bool ok = GetWindowRect(h, out rc);
@@ -224,7 +244,8 @@ if ($Watchdog -gt 0) {
             if ([int]$st.pid -eq $Watchdog) {
                 foreach ($v in @($st.windows)) {
                     $h = [IntPtr][int64]$v
-                    if ([Win]::Alive($h)) { [Win]::SetAlpha($h, 255) | Out-Null; $n++ }
+                    # 只还原「统一 alpha 模式」的窗口：逐像素分层的窗口本来就不该动
+                    if ([Win]::Alive($h) -and [Win]::GetAlpha($h) -ge 0) { [Win]::SetAlpha($h, 255) | Out-Null; $n++ }
                 }
                 foreach ($v in @($st.minimized)) {
                     $h = [IntPtr][int64]$v
@@ -288,6 +309,8 @@ $script:lastIn     = @{}     # 窗口句柄 -> 最后一次确认光标在该窗
 $script:wasMin     = @{}     # 窗口句柄 -> 上一轮是否最小化，用来识别「刚被还原」
 $script:applied    = @{}     # 句柄 -> 上次真正设下去的 alpha，避免每轮都重复调 API
 $script:insideCache = @{}    # 句柄 -> 上一轮光标是否在该窗口内
+$script:origLayered = @{}    # 句柄 -> 我们动手前的分层状态（退出时照着还原）
+$script:skipWin     = @{}    # 句柄 -> 不碰（自己就在做分层透明的窗口）
 $script:group      = @{}     # 目标窗口句柄 -> 它自己 + 派生窗口（这一组一起受这份配置管）
 $script:candidates = @()     # 当前可当目标的窗口（有标题、非工具窗口的主窗口）
 $script:closeAsked = @{}     # 已经请求过关窗的目标，避免每轮轮询重复发 WM_CLOSE
@@ -440,7 +463,8 @@ if ($LivePath -and (Test-Path -LiteralPath $LivePath)) {
             $n = 0
             foreach ($v in @($st.windows)) {
                 $h = [IntPtr][int64]$v
-                if ([Win]::Alive($h)) { [Win]::SetAlpha($h, 255) | Out-Null; $n++ }
+                # 只还原「统一 alpha 模式」的窗口：逐像素分层的窗口本来就不该动
+                if ([Win]::Alive($h) -and [Win]::GetAlpha($h) -ge 0) { [Win]::SetAlpha($h, 255) | Out-Null; $n++ }
             }
             foreach ($v in @($st.minimized)) {
                 $h = [IntPtr][int64]$v
@@ -548,6 +572,19 @@ function Get-WantAlpha($cfg, [bool]$inside) {
 
 # 唯一的下发点：算出目标值，变了才调 API（有些程序重绘后会丢 WS_EX_LAYERED，那种也要补一次）
 function Set-TargetAlpha([IntPtr]$h, $cfg, [bool]$inside) {
+    # 动手前先记住它本来是什么分层状态，退出时按原样还回去
+    if (-not $script:origLayered.ContainsKey($h)) {
+        $mode = [Win]::LayeredMode($h)
+        $script:origLayered[$h] = @{ mode = $mode; alpha = [Win]::GetAlpha($h) }
+        if ($mode -ne 'none' -or [Win]::NoRedirectionBitmap($h)) {
+            # 它自己就在做透明（Qt 弹窗那种逐像素分层），套统一 alpha 会让它整块变黑 —— 宁可它不透明，
+            # 也不能让它画不出来。这类窗口直接跳过，连退出还原都不碰
+            $script:skipWin[$h] = $true
+            Write-UiLog ("跳过 0x{0:X}（{1} - {2}）：它自己用分层透明，改成统一透明度会让它变黑" -f $h.ToInt64(), [Win]::Proc($h), [Win]::Title($h))
+        }
+    }
+    if ($script:skipWin.ContainsKey($h)) { return }
+
     $want = Get-WantAlpha $cfg $inside
     if ($script:applied[$h] -ne $want -or ($want -lt 255 -and -not [Win]::HasLayered($h))) {
         [Win]::SetAlpha($h, $want) | Out-Null
@@ -581,10 +618,19 @@ function Restore-All {
 function Reset-Alpha {
     # 只还原我们真正动过的句柄，别去碰同进程里我们没改过的窗口
     foreach ($h in @($script:applied.Keys)) {
-        if ([Win]::Alive($h)) { [Win]::SetAlpha($h, 255) | Out-Null }
+        if (-not [Win]::Alive($h)) { continue }
+        $orig = $script:origLayered[$h]
+        if ($orig -and $orig.mode -eq 'lwa' -and [int]$orig.alpha -ge 0) {
+            # 这个窗口本来就有自己的 alpha，还原成它原来的值，而不是粗暴清掉分层位
+            [Win]::SetAlpha($h, [int]$orig.alpha) | Out-Null
+        } else {
+            [Win]::SetAlpha($h, 255) | Out-Null
+        }
     }
     $script:applied.Clear()
     $script:insideCache.Clear()
+    $script:origLayered.Clear()
+    $script:skipWin.Clear()
 }
 
 # 记下当前改过哪些窗口，崩溃时看门狗按它还原。内容没变就不重写盘
@@ -846,6 +892,7 @@ function Show-Panel([string]$why) {
     try {
         $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
         if (-not $form.Visible) { $form.Show() }
+        [Win]::ShowIt($form.Handle)
         $form.Activate()
     } finally {
         $script:suppressHide = $false
