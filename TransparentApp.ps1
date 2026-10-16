@@ -125,6 +125,8 @@ $script:applied    = @{}     # 句柄 -> 上次真正设下去的 alpha，避免
 $script:insideCache = @{}    # 句柄 -> 上一轮光标是否在该窗口内
 $script:checkedWin  = @{}    # 句柄 -> 已经判定过「能不能碰」了
 $script:skipWin     = @{}    # 句柄 -> 不碰（自己就在逐像素分层画的窗口）
+$script:members    = @{}     # 上一轮扫描时全部组的成员集合，用来发现这一轮「出组」的窗口
+$script:joinedAt   = @{}     # 句柄 -> 刚进组的时间，新来的先观察两秒再谈最小化
 $script:group      = @{}     # 目标窗口句柄 -> 它自己 + 派生窗口（这一组一起受这份配置管）
 $script:candidates = @()     # 当前可当目标的窗口（有标题、非工具窗口的主窗口）
 $script:closeAsked = @{}     # 已经请求过关窗的目标，避免每轮轮询重复发 WM_CLOSE
@@ -335,8 +337,14 @@ function Scan-Windows {
     if ($script:follow) {
         foreach ($w in @($deps)) {
             $owner = [Win]::RootOf([Win]::Owner($w))
-            if ($owner -ne [IntPtr]::Zero -and $g.ContainsKey($owner)) { [void]$g[$owner].Add($w); continue }
-            # 没有属主可依（微信表情面板就是这种）：同进程下只挂了一个目标窗口时归它
+            if ($owner -ne [IntPtr]::Zero) {
+                # 有属主就只认属主，属主不是目标就不收编。原来这里会继续落到下面的同进程兜底，
+                # Chrome 的「翻译此页？」气泡这类属主是普通窗口的弹层就是这样被误收的，
+                # 表现出来就是没勾选的窗口被透明、被最小化
+                if ($g.ContainsKey($owner)) { [void]$g[$owner].Add($w) }
+                continue
+            }
+            # 完全没有属主（微信表情面板就是这种）：同进程下只挂了一个目标窗口时归它
             $same = @($g.Keys | Where-Object { [Win]::Alive($_) -and [Win]::Pid($_) -eq [Win]::Pid($w) })
             if ($same.Count -eq 1) { [void]$g[$same[0]].Add($w) }
         }
@@ -346,6 +354,34 @@ function Scan-Windows {
             if ($owner -ne [IntPtr]::Zero -and $g.ContainsKey($owner)) { [void]$g[$owner].Add($w) }
         }
     }
+    # 出组收尾：上一轮还是某个目标的组员、这一轮不在了的窗口，把我们动过的东西还回去。
+    # 派生窗口有时只是「无标题一瞬间」被收进来（新建浏览器窗口、Chrome 的临时气泡），
+    # 标题一恢复就出组——没人管的话它会一直带着我们设的 alpha（甚至最小化状态）留在桌面上，
+    # 表现出来就是「没勾选的窗口自己在透明/消失」。
+    $members = @{}
+    foreach ($k in @($g.Keys)) { foreach ($w in @($g[$k])) { $members[$w] = $true } }
+    foreach ($h in @($script:members.Keys)) {
+        if ($members.ContainsKey($h)) { continue }
+        if ([Win]::Alive($h)) {
+            if ($script:applied.ContainsKey($h)) {
+                [Win]::SetAlpha($h, 255) | Out-Null
+                $script:applied.Remove($h) | Out-Null
+            }
+            if ($script:minimized.Contains($h)) {
+                # 只在窗口确实还被最小化时才叫醒它：用户可能早自己还原了，
+                # 这时再 ShowWindow(SW_RESTORE) 会把它重新抢到前台，白白打断用户
+                if ([Win]::Minimized($h)) { [Win]::Restore($h) | Out-Null }
+                $script:minimized.Remove($h) | Out-Null
+            }
+        }
+        $script:insideCache.Remove($h) | Out-Null
+        $script:joinedAt.Remove($h) | Out-Null
+    }
+    # 死句柄清理：句柄会被系统复用，按句柄记的判定和状态留着会误伤下一个拿到它的窗口
+    foreach ($h in @($script:applied.Keys))    { if (-not [Win]::Alive($h)) { $script:applied.Remove($h) | Out-Null; $script:insideCache.Remove($h) | Out-Null } }
+    foreach ($h in @($script:checkedWin.Keys)) { if (-not [Win]::Alive($h)) { $script:checkedWin.Remove($h) | Out-Null; $script:skipWin.Remove($h) | Out-Null } }
+    for ($i = $script:minimized.Count - 1; $i -ge 0; $i--) { if (-not [Win]::Alive($script:minimized[$i])) { $script:minimized.RemoveAt($i) } }
+    $script:members = $members
     $script:group = $g
     $script:scanAt = Get-Date
 }
@@ -737,6 +773,7 @@ function Get-ActionIndex([string]$id) {
 function Close-TargetWindows([IntPtr]$h) {
     $n = 0
     foreach ($w in @(Get-Group $h)) {
+        if ($script:skipWin.ContainsKey($w)) { continue }   # 说不碰的窗口连关都不关
         if ([Win]::Alive($w)) { [Win]::PostClose($w) | Out-Null; $n++ }
     }
     return $n
@@ -897,6 +934,7 @@ $lbTargets.add_ItemCheck({
         Load-Selected
     } else {
         foreach ($w in @(Get-Group $h)) {
+            if ($script:skipWin.ContainsKey($w)) { continue }   # 不碰的窗口别去动它的分层属性
             if ([Win]::Alive($w)) { [Win]::SetAlpha($w, 255) | Out-Null }
             $script:applied.Remove($w) | Out-Null
         }
@@ -919,6 +957,7 @@ $btnRefresh.add_Click({ Refresh-Targets })
 $btnRemove.add_Click({
     if (-not $script:selected) { return }
     foreach ($w in @(Get-Group $script:selected)) {
+        if ($script:skipWin.ContainsKey($w)) { continue }   # 不碰的窗口别去动它的分层属性
         if ([Win]::Alive($w)) { [Win]::SetAlpha($w, 255) | Out-Null }
         $script:applied.Remove($w) | Out-Null
     }
@@ -1171,6 +1210,7 @@ $timer.add_Tick({
         $restored = $false
         foreach ($h in $hwnds) {
             if (-not [Win]::Alive($h)) { continue }
+            if (-not $script:joinedAt.ContainsKey($h)) { $script:joinedAt[$h] = $now }
             $script:insideCache[$h] = $inside
             Set-TargetAlpha $h $cfg $inside
             $min = [Win]::Minimized($h)
@@ -1201,6 +1241,9 @@ $timer.add_Tick({
         # 只收走光标不在上面的那些窗口：同一个程序开了多个窗口时别把人正在看的也最小化
         foreach ($h in $hwnds) {
             if (-not [Win]::Alive($h) -or [Win]::Minimized($h)) { continue }
+            if ($script:skipWin.ContainsKey($h)) { continue }   # 说不碰的窗口，最小化也别做
+            # 刚进组的先给两秒观察期：新建窗口的头两秒常常没有标题，别把它当派生窗口收走
+            if ($script:joinedAt.ContainsKey($h) -and ($now - $script:joinedAt[$h]).TotalSeconds -lt 2) { continue }
             $l = 0; $t = 0; $r = 0; $b = 0
             if ([Win]::Rect($h, [ref]$l, [ref]$t, [ref]$r, [ref]$b) -and
                 $x -ge $l -and $x -lt $r -and $y -ge $t -and $y -lt $b) { continue }
