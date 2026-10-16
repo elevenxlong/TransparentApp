@@ -79,7 +79,7 @@ if ($Watchdog -gt 0) {
 
 # 任务栏图标：宿主进程是 powershell.exe，不显式指定 AppUserModelID 的话
 # 任务栏会一直拿宿主进程的图标（那个蓝色 PowerShell 图标），窗口自己设的 Icon 不生效
-$script:appIdResult = [Win]::SetAppId("TransparentApp.Panel")
+$script:appIdResult = [Win]::SetAppId("Clock")
 
 # 是否该最小化。$last 为空表示「还没确认光标进过这个窗口」，此时不参与最小化；
 # 窗口从最小化恢复后由调用方清空 $last，效果就是「光标得先进来一次才会重新计时」
@@ -648,13 +648,36 @@ function New-AppIcon([int]$size) {
     return [System.Drawing.SystemIcons]::Application
 }
 
+# 伪装用图标：运行时画一个时钟（表盘 + 10:10 造型的指针），不依赖任何 ico 文件
+$script:clockIconBmp = $null   # 留个引用别让位图被 GC 收走（HICON 已独立，留一份更保险）
+function New-ClockIcon([int]$size) {
+    $bmp = New-Object System.Drawing.Bitmap($size, $size)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $ink = [System.Drawing.Color]::FromArgb(90, 90, 90)
+    $pad = [float]($size * 0.07)
+    $penRing = New-Object System.Drawing.Pen($ink, [float][Math]::Max(1.0, $size * 0.09))
+    $g.DrawEllipse($penRing, $pad, $pad, [float]($size - 2 * $pad - 1), [float]($size - 2 * $pad - 1))
+    $cx = [float]($size / 2.0); $cy = [float]($size / 2.0)
+    $penH = New-Object System.Drawing.Pen($ink, [float][Math]::Max(1.0, $size * 0.12))
+    $penM = New-Object System.Drawing.Pen($ink, [float][Math]::Max(1.0, $size * 0.08))
+    $g.DrawLine($penH, $cx, $cy, [float]($cx - $size * 0.17), [float]($cy - $size * 0.10))
+    $g.DrawLine($penM, $cx, $cy, [float]($cx + $size * 0.15), [float]($cy - $size * 0.21))
+    $h = $bmp.GetHicon()
+    foreach ($p in @($penRing, $penH, $penM)) { $p.Dispose() }
+    $g.Dispose()
+    $script:clockIconBmp = $bmp
+    return [System.Drawing.Icon]::FromHandle($h)
+}
+
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "TransparentApp"
-$form.Icon = New-AppIcon 32
+$form.Text = "时钟"
+$form.Icon = New-ClockIcon 32
 $form.ClientSize = New-Object System.Drawing.Size(380, 452)
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
+$form.KeyPreview = $true   # Esc 要先到 form：真实面板上按 Esc 切回伪装时钟
 
 $lblAlpha = New-Object System.Windows.Forms.Label
 $lblAlpha.AutoSize = $false   # 不关掉 AutoSize 的话 .Size 会被忽略，长文字直接把面板撑出去
@@ -737,11 +760,71 @@ $form.Controls.AddRange(@($lblAlpha, $tbAlpha, $chkStealth, $lblAction, $cbActio
 function Update-AlphaLabel {
     # 选中窗口的名字放标题栏：面板宽度有限，塞在这一行里必然被截断或者压到下面的控件上
     $name = ""
-    if ($script:selected -and [Win]::Alive($script:selected)) { $name = Get-SafeLabel $script:selected }
+    # 伪装视图不把选中窗口名亮出来；标题任何时候都不出现 TransparentApp 字样
+    if (-not $script:camouflaged -and $script:selected -and [Win]::Alive($script:selected)) { $name = Get-SafeLabel $script:selected }
     if ($name.Length -gt 48) { $name = $name.Substring(0, 48) + "…" }
-    $form.Text = if ($name) { "TransparentApp · $name" } else { "TransparentApp" }
+    $form.Text = if ($name) { "时钟 · $name" } else { "时钟" }
     $lblAlpha.Text = "透明度 $($tbAlpha.Value)%"
 }
+
+# ---------------- 伪装视图 ----------------
+# 面板打开先给人看一个时钟，双击（或真实面板上按 Esc 反向）才露出真实控件。
+# 托盘图标 / 悬停文字 / 窗口标题 / 任务栏分组统一伪装成「时钟」这一个身份
+$script:camouflaged = $true
+$script:realCtrls = @($lblAlpha, $tbAlpha, $chkStealth, $lblAction, $cbAction, $cbDelay, $chkFollow, $lblTargets, $lbTargets, $btnRefresh, $btnRemove, $btnRestore, $btnExit)
+
+$lblClockTime = New-Object System.Windows.Forms.Label
+$lblClockTime.AutoSize = $false
+$lblClockTime.Font = New-Object System.Drawing.Font('Segoe UI', 42)
+$lblClockTime.TextAlign = 'MiddleCenter'
+$lblClockTime.Location = New-Object System.Drawing.Point(12, 140)
+$lblClockTime.Size = New-Object System.Drawing.Size(356, 100)
+$lblClockDate = New-Object System.Windows.Forms.Label
+$lblClockDate.AutoSize = $false
+$lblClockDate.Font = New-Object System.Drawing.Font('Segoe UI', 12)
+$lblClockDate.TextAlign = 'MiddleCenter'
+$lblClockDate.Location = New-Object System.Drawing.Point(12, 248)
+$lblClockDate.Size = New-Object System.Drawing.Size(356, 28)
+$form.Controls.AddRange(@($lblClockTime, $lblClockDate))
+
+# 中文星期自己映射，不吃系统语言
+function Update-ClockLabel {
+    $now = Get-Date
+    $lblClockTime.Text = $now.ToString('HH:mm:ss')
+    $wd = @('星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六')[[int]$now.DayOfWeek]
+    $lblClockDate.Text = ("{0}年{1}月{2}日 {3}" -f $now.Year, $now.Month, $now.Day, $wd)
+}
+
+function Set-Camouflaged([bool]$on) {
+    $script:camouflaged = $on
+    foreach ($c in $script:realCtrls) { $c.Visible = -not $on }
+    $lblClockTime.Visible = $on
+    $lblClockDate.Visible = $on
+    if ($on) { Update-ClockLabel }
+    Update-AlphaLabel
+}
+
+# 只有伪装视图双击才切换；真实面板上双击不做事（防误触）
+$onDoubleClickCamouflage = {
+    if ($script:camouflaged) {
+        Set-Camouflaged $false
+        Write-UiLog "面板视图：伪装时钟 -> 真实控件"
+    }
+}
+$lblClockTime.add_DoubleClick($onDoubleClickCamouflage)
+$lblClockDate.add_DoubleClick($onDoubleClickCamouflage)
+$form.add_DoubleClick($onDoubleClickCamouflage)
+
+# 真实面板上按 Esc 立刻切回时钟；收起再打开也会回到时钟（Show-Panel 里强制）
+$form.add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape -and -not $script:camouflaged) {
+        Set-Camouflaged $true
+        Write-UiLog "面板视图：按 Esc 切回伪装时钟"
+    }
+})
+
+Set-Camouflaged $true   # 第一屏就是时钟
 
 function Get-DelayIndex([int]$ms) {
     for ($i = 0; $i -lt $DelayOptions.Count; $i++) { if ($DelayOptions[$i].ms -eq $ms) { return $i } }
@@ -751,6 +834,7 @@ function Get-DelayIndex([int]$ms) {
 
 # 显示面板的唯一入口。三处调用（托盘图标 / 托盘菜单 / 再次启动）都走这里，日志才不会有漏
 function Show-Panel([string]$why) {
+    Set-Camouflaged $true   # 叫出来先回到时钟：别把上次没关的真实面板亮给人看
     Write-UiLog "面板显示：$why"
     $script:suppressHide = $true
     try {
@@ -991,8 +1075,8 @@ $form.add_FormClosing({
         Write-UiLog "面板隐藏：点了 X 收起"
         if (-not $script:hintedTray) {
             $script:hintedTray = $true
-            $tray.ShowBalloonTip(5000, "TransparentApp 还在运行",
-                "点 X 只是收起面板。要退出请用托盘右键 -> 退出并恢复透明度。",
+            $tray.ShowBalloonTip(5000, "时钟还在运行",
+                "点 X 只是收起面板。要退出请用托盘右键 -> 退出。",
                 [System.Windows.Forms.ToolTipIcon]::Info)
         }
         return
@@ -1010,32 +1094,10 @@ $form.add_Shown({
 
 # -UiTest：在真实消息循环里跑一遍「勾程序 -> 拖滑块 -> 开隐身 -> 点 X -> 退出」
 if ($UiTest) {
-    $t2 = New-Object System.Windows.Forms.Timer
-    $t2.Interval = 1500
-    $t2.add_Tick({
-        param($s, $e)
-        $s.Stop()
-        # 挑一个 chrome 窗口做探针，没有就用列表第一行
-        $h = [IntPtr]::Zero
-        foreach ($w in @($script:listHwnd)) { if ([Win]::Proc($w) -eq 'chrome') { $h = $w; break } }
-        if ($h -eq [IntPtr]::Zero -and $script:listHwnd.Count -gt 0) { $h = $script:listHwnd[0] }
-        if ($h -eq [IntPtr]::Zero) { Write-Host "UITEST FAIL: 列表里没有可用窗口"; Stop-App; return }
-        $script:uiProbe = $h
-        $idx = [array]::IndexOf($script:listHwnd, $h)
-        $grp = @(Get-Group $h)
-        Write-Host ("UITEST 探针 {0}（hwnd=0x{1:X}，这一组 {2} 个窗口）列表行 {3}" -f (Get-SafeLabel $h), $h.ToInt64(), $grp.Count, $idx)
-        Write-Host ("UITEST 任务栏图标 {0}x{1}，托盘图标 {2}x{3}" -f $form.Icon.Width, $form.Icon.Height, $tray.Icon.Width, $tray.Icon.Height)
-        if ($form.Icon.Width -ne 32) { Write-Host "UITEST FAIL: 任务栏图标不是 32x32，说明没取到 .ico" }
-        $winIcon = [Win]::GetWindowIcon($form.Handle)
-        Write-Host ("UITEST AppUserModelID 设置结果={0}，窗口大图标句柄=0x{1:X}，form.Icon.Handle=0x{2:X}" -f $script:appIdResult, $winIcon.ToInt64(), $form.Icon.Handle.ToInt64())
-        if ($winIcon -eq [IntPtr]::Zero) { Write-Host "UITEST FAIL: 窗口没设上自己的图标" }
-        if ($winIcon -ne $form.Icon.Handle) { Write-Host "UITEST FAIL: 窗口图标句柄和 form.Icon 不一致" }
-        if ($script:appIdResult -ne 0) { Write-Host "UITEST FAIL: AppUserModelID 没设成功（返回值 $($script:appIdResult)），任务栏会退回显示 powershell 图标" }
-        Write-Host ("UITEST 延迟档位：{0}" -f (($DelayOptions | ForEach-Object { $_.text }) -join ' / '))
-
-        # 布局自检：控件之间不许互相压住，文字不许超出控件宽度（截图里那种「有遮挡」就是这类问题）
+    # 布局自检：只查当前可见的控件——伪装视图查时钟那一层，切到真实面板再查控件那一层
+    function Test-UiLayout {
         $bad = @()
-        $ctrls = @($form.Controls)
+        $ctrls = @($form.Controls | Where-Object { $_.Visible })
         for ($i = 0; $i -lt $ctrls.Count; $i++) {
             for ($j = $i + 1; $j -lt $ctrls.Count; $j++) {
                 if ($ctrls[$i].Bounds.IntersectsWith($ctrls[$j].Bounds)) {
@@ -1060,10 +1122,50 @@ if ($UiTest) {
                 }
             }
         }
+        $bad
+    }
+
+    $t2 = New-Object System.Windows.Forms.Timer
+    $t2.Interval = 1500
+    $t2.add_Tick({
+        param($s, $e)
+        $s.Stop()
+        # 挑一个 chrome 窗口做探针，没有就用列表第一行
+        $h = [IntPtr]::Zero
+        foreach ($w in @($script:listHwnd)) { if ([Win]::Proc($w) -eq 'chrome') { $h = $w; break } }
+        if ($h -eq [IntPtr]::Zero -and $script:listHwnd.Count -gt 0) { $h = $script:listHwnd[0] }
+        if ($h -eq [IntPtr]::Zero) { Write-Host "UITEST FAIL: 列表里没有可用窗口"; Stop-App; return }
+        $script:uiProbe = $h
+        $idx = [array]::IndexOf($script:listHwnd, $h)
+        $grp = @(Get-Group $h)
+        Write-Host ("UITEST 探针 {0}（hwnd=0x{1:X}，这一组 {2} 个窗口）列表行 {3}" -f (Get-SafeLabel $h), $h.ToInt64(), $grp.Count, $idx)
+        Write-Host ("UITEST 任务栏图标 {0}x{1}，托盘图标 {2}x{3}" -f $form.Icon.Width, $form.Icon.Height, $tray.Icon.Width, $tray.Icon.Height)
+        if ($form.Icon.Width -ne 32) { Write-Host "UITEST FAIL: 任务栏图标不是 32x32，说明窗口图标没设置好" }
+        $winIcon = [Win]::GetWindowIcon($form.Handle)
+        Write-Host ("UITEST AppUserModelID 设置结果={0}，窗口大图标句柄=0x{1:X}，form.Icon.Handle=0x{2:X}" -f $script:appIdResult, $winIcon.ToInt64(), $form.Icon.Handle.ToInt64())
+        if ($winIcon -eq [IntPtr]::Zero) { Write-Host "UITEST FAIL: 窗口没设上自己的图标" }
+        if ($winIcon -ne $form.Icon.Handle) { Write-Host "UITEST FAIL: 窗口图标句柄和 form.Icon 不一致" }
+        if ($script:appIdResult -ne 0) { Write-Host "UITEST FAIL: AppUserModelID 没设成功（返回值 $($script:appIdResult)），任务栏会退回显示 powershell 图标" }
+        Write-Host ("UITEST 延迟档位：{0}" -f (($DelayOptions | ForEach-Object { $_.text }) -join ' / '))
+
+        # 布局自检：控件之间不许互相压住，文字不许超出控件宽度（截图里那种「有遮挡」就是这类问题）。
+        # 伪装视图和真实面板视图各查一遍
+        $bad = @()
+        $lb = Test-UiLayout
+        if ($lb) { $bad += $lb }
+        Write-Host ("UITEST 伪装视图 时钟可见={0} 真实控件可见={1}（应为 True False）" -f $lblClockTime.Visible, $tbAlpha.Visible)
+        if (-not $lblClockTime.Visible) { Write-Host "UITEST FAIL: 面板打开时没有先显示伪装时钟" }
+        if ($tbAlpha.Visible) { Write-Host "UITEST FAIL: 伪装视图下真实控件没有藏起来" }
+        $onDoubleClickCamouflage.Invoke()   # 等价于双击时钟
+        if ($script:camouflaged) { Write-Host "UITEST FAIL: 双击时钟没有切到真实面板" }
+        if (-not $tbAlpha.Visible -or $lblClockTime.Visible) { Write-Host "UITEST FAIL: 切换后可见性不对（真实控件应显示、时钟应隐藏）" }
+        $lb = Test-UiLayout
+        if ($lb) { $bad += $lb }
+        Write-Host ("UITEST 真实面板视图 时钟可见={0} 真实控件可见={1}（应为 False True）" -f $lblClockTime.Visible, $tbAlpha.Visible)
         if ($bad.Count -gt 0) {
             foreach ($b in $bad) { Write-Host "UITEST FAIL: $b" }
         } else {
-            Write-Host ("UITEST 布局自检通过：{0} 个控件无重叠、文字都在框内" -f $ctrls.Count)
+            Write-Host "UITEST 布局自检通过（伪装视图 + 真实面板视图都查过）"
         }
 
         $lbTargets.SetItemChecked($idx, $true)
@@ -1136,21 +1238,21 @@ if ($UiTest) {
 
 # ---------------- 托盘 ----------------
 $tray = New-Object System.Windows.Forms.NotifyIcon
-$tray.Icon = New-AppIcon ([System.Windows.Forms.SystemInformation]::SmallIconSize.Width)
-$tray.Text = "TransparentApp"
+$tray.Icon = New-ClockIcon ([System.Windows.Forms.SystemInformation]::SmallIconSize.Width)
+$tray.Text = "时钟"
 
 # 菜单一次性建好，不在 Opening 里重建：重建要枚举窗口 + 查进程名，慢到右击要点好几次才弹
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
-$miShow = New-Object System.Windows.Forms.ToolStripMenuItem("显示控制面板")
+$miShow = New-Object System.Windows.Forms.ToolStripMenuItem("打开")
 $miShow.add_Click({
     param($s, $e)
     Show-Panel "从托盘菜单点「显示控制面板」"
 })
 $menu.Items.Add($miShow) | Out-Null
-$miRestore = New-Object System.Windows.Forms.ToolStripMenuItem("还原全部窗口")
+$miRestore = New-Object System.Windows.Forms.ToolStripMenuItem("恢复全部窗口")
 $miRestore.add_Click({ param($s, $e) Restore-All })
 $menu.Items.Add($miRestore) | Out-Null
-$miExit = New-Object System.Windows.Forms.ToolStripMenuItem("退出并恢复透明度")
+$miExit = New-Object System.Windows.Forms.ToolStripMenuItem("退出")
 $miExit.add_Click({ param($s, $e) Stop-App })
 $menu.Items.Add($miExit) | Out-Null
 
@@ -1167,6 +1269,11 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $PollMs
 $timer.add_Tick({
     param($s, $e)
+    # 伪装时钟每秒走一格；只在可见且文字变化时才更新，别让 Label 每 200ms 白重绘
+    if ($lblClockTime.Visible) {
+        $clockText = (Get-Date).ToString('HH:mm:ss')
+        if ($clockText -ne $lblClockTime.Text) { Update-ClockLabel }
+    }
     # 拖滑块一秒能触发几十次事件，攒到轮询里写一次，别每个事件都落盘
     if ($script:cfgDirty) { $script:cfgDirty = $false; Save-Config }
     if (((Get-Date) - $script:scanAt).TotalMilliseconds -gt $WindowCacheMs) { Scan-Windows }
